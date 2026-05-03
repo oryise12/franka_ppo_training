@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.codex
+
+ppo_tensorboard/
+ppo_tensorboard_pose_obstacle/
