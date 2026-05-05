@@ -16,7 +16,7 @@ class FrankaTsidEnv(gym.Env):
     def __init__(self, render_mode=None, print_step_info=True, viewer_sync_interval=10):
         super().__init__()
         self.render_mode = render_mode
-        self.is_play_mode = (render_mode == "human") # 🌟 [NEW] play.py인지 기억해두기!
+        self.is_play_mode = (render_mode == "human") # [NEW] play.py인지 기억해두기!
         self.viewer = None
         self.print_step_info = print_step_info
         self.viewer_sync_interval = max(1, int(viewer_sync_interval))
@@ -24,39 +24,36 @@ class FrankaTsidEnv(gym.Env):
         self.target_arrow_mocap_idx = -1
         self.action_arrow_mocap_idx = -1
         self.ee_arrow_mocap_idx = -1
-        self.obstacle_pos = np.array([0.45, 0.0, 0.35], dtype=float)
-        self.obstacle_size = np.array([0.018, 0.035, 0.035], dtype=float)
-        self.obstacle_radius = np.linalg.norm(self.obstacle_size)
-        self.obstacle_safety_margin = 0.0
-        self.obstacle_safe_dist = 0.08
-        self.obstacle_mocap_idx = -1
-        self.obstacle_geom_id = -1
-        self.contact_marker_mocap_idx = -1
-        self.last_obstacle_contact_pos = np.array([0.0, 0.0, -1.0], dtype=float)
-        self.prev_dist_to_bottle = 0.0
-        self.progress_reward_weight = 2.0
-        self.orientation_reward_weight = 0.15
-        self.action_reward_weight = 0.01
-        self.obstacle_near_weight = 2.0
         self.collision_penalty = 10.0
         self.success_bonus = 5.0
         self.max_steps = 500 
         self.current_step = 0
+
+        self.orientation_reward_weight = 2.0
+        self.progress_reward_weight = 10.0
+        self.action_reward_weight = 0.1
+
         # --- (기존 Action/Observation Space 세팅 그대로) ---
-        # action = [delta position xyz, delta orientation rotvec xyz]
+
+        # action = [delta position(3), delta rotvec(3), Kp_x, Kp_y, Kp_z(3)]
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
-            shape=(6,), 
+            shape=(9,), 
             dtype=np.float32
         )
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(27,), dtype=np.float32)
-        
+        # observation = q(7)+dq(7)+ee_pos(3)+pos_err(3)+ori_err(3) + wrench(6) = 총 29차원
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(29,), dtype=np.float32)
+        # addition: 가변 강성(Stiffness) 제어를 위한 변수 초기화
+        self.kp_pos_min = np.array([50.0, 50.0, 50.0], dtype=float)
+        self.kp_pos_max = np.array([1000.0, 1000.0, 1000.0], dtype=float)
+        self.current_Kp_pos = np.ones(3) * 260.0
+        self.current_Kd_pos = 2.0 * np.sqrt(self.current_Kp_pos)
+        self.current_wrench = np.zeros(6, dtype=np.float32)
+
         # --- (기존 MuJoCo / Pinocchio 초기화 세팅 그대로) ---
         menagerie_dir = os.path.expanduser("~/ros2_ws_py/src/mujoco_menagerie/franka_emika_panda")
-        pose_obstacle_xml = os.path.join(menagerie_dir, "scene_pose_obstacle.xml")
-        fallback_xml = os.path.join(menagerie_dir, "scene.xml")
-        xml_path = pose_obstacle_xml if os.path.exists(pose_obstacle_xml) else fallback_xml
+        xml_path = os.path.join(menagerie_dir, "scene.xml")
         self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self.mj_data = mujoco.MjData(self.mj_model)
         self.pin_model = pin.buildModelFromUrdf(URDF_PATH)
@@ -118,11 +115,8 @@ class FrankaTsidEnv(gym.Env):
         mujoco.mj_forward(self.mj_model, self.mj_data)
         
         # 이번 에피소드의 목표 pose 생성
-        self.target_bottle_pos = np.array([
-            np.random.uniform(0.35, 0.55),
-            np.random.uniform(-0.2, 0.2),
-            np.random.uniform(0.25, 0.45)
-        ])
+        # 🌟 [NEW] 버튼이 위치한 좌표 (x=0.5, y=0.0, z=0.44)로 타겟 고정
+        self.target_bottle_pos = np.array([0.5, 0.0, 0.44])
         self.target_ee_quat = self._sample_target_quat()
 
         curr_ee_pos = self._get_ee_pos()
@@ -130,11 +124,9 @@ class FrankaTsidEnv(gym.Env):
         self.subgoal_ee_quat = self._get_ee_quat()
         self.integral_error_pos = np.zeros(3)
         self.integral_error_rot = np.zeros(3)
-        self._sample_obstacle_on_path(curr_ee_pos, self.target_bottle_pos)
         self._update_target_visuals()
         self._update_action_visuals(self.target_ee_pos, self.subgoal_ee_quat)
         self._update_ee_visuals(curr_ee_pos, self.subgoal_ee_quat)
-        self._update_obstacle_geom()
         self.prev_dist_to_bottle = np.linalg.norm(self.target_bottle_pos - curr_ee_pos)
         self.current_step = 0
         return self._get_obs(), {}
@@ -148,12 +140,16 @@ class FrankaTsidEnv(gym.Env):
         # 1. 현재 손끝 pose 가져오기
         curr_ee_pos = self._get_ee_pos()
         
-        # 2. PPO가 작은 pose sub-goal delta를 생성합니다.
+        # 2. PPO가 위치 변화량(Delta)과 강성(Stiffness)을 생성합니다.
         max_step_size = 0.07 
         max_rot_step = 0.20
         delta_pos = action[:3] * max_step_size
-        delta_rot = action[3:] * max_rot_step
+        delta_rot = action[3:6] * max_rot_step
         
+        # addition: Kp Action[-1, 1]을 실제 물리 범위[50, 1000]로 스케일링
+        action_kp = action[6:9]
+        self.current_Kp_pos = self.kp_pos_min + 0.5 * (action_kp + 1.0) * (self.kp_pos_max - self.kp_pos_min)
+        self.current_Kd_pos = 2.0 * np.sqrt(self.current_Kp_pos) # 임계 감쇠 자동 유지
         # 다음 목표 위치 = 현재 위치 + 이동할 상댓값
 
         intended_pos = self.target_ee_pos + delta_pos
@@ -179,7 +175,7 @@ class FrankaTsidEnv(gym.Env):
         if self.action_mocap_idx != -1:
             self.mj_data.mocap_pos[self.action_mocap_idx] = desired_pos
         self._update_action_visuals(desired_pos, self.subgoal_ee_quat)
-        self._update_obstacle_geom()
+
 
         # TSID + 시뮬레이션 50번 반복
         for substep_idx in range(self.n_substeps):
@@ -199,32 +195,33 @@ class FrankaTsidEnv(gym.Env):
         self._update_ee_visuals(new_ee_pos, new_ee_quat)
         dist_to_bottle = np.linalg.norm(self.target_bottle_pos - new_ee_pos)
         orientation_error = np.linalg.norm(self._orientation_error(self.target_ee_quat, new_ee_quat))
-        obstacle_collision, obstacle_contact_count, obstacle_clearance, obstacle_contact_pos = self._get_obstacle_contact_info()
-        self._update_contact_marker(obstacle_contact_pos)
-        obstacle_penalty = 1.0 if obstacle_collision else 0.0
-        progress_reward = self.prev_dist_to_bottle - dist_to_bottle
-        obstacle_near_penalty = max(0.0, self.obstacle_safe_dist - obstacle_clearance)
+        
         
         # ----------------------------------------------------
-        # 🌟 보상 함수 계산
+        #  보상 함수 계산
         # ----------------------------------------------------
+        # 🌟 [NEW] progress_reward 계산식 복구
+        progress_reward = self.prev_dist_to_bottle - dist_to_bottle
         reward = -dist_to_bottle 
         reward -= self.orientation_reward_weight * orientation_error
         reward += self.progress_reward_weight * progress_reward
         reward -= self.action_reward_weight * np.linalg.norm(action) # Jerk 방지
         reward -= wall_penalty                   # 벽 충돌 전기충격
-        reward -= self.obstacle_near_weight * obstacle_near_penalty
-        reward -= 0.8 * obstacle_penalty
-        self.prev_dist_to_bottle = dist_to_bottle
         
-        # 🌟 스텝 카운트 증가
+        #  addition: Z축 외부 힘이 15N을 초과하면 강력한 패널티 (안전 접촉 유도)
+        force_z_abs = abs(self.current_wrench[2])
+        if force_z_abs > 15.0:
+            reward -= 0.1 * (force_z_abs - 15.0)
+            
+        self.prev_dist_to_bottle = dist_to_bottle        
+        # 스텝 카운트 증가
         self.current_step += 1 
 
         terminated = False
         truncated = False
         
         # 실패 조건 (해고)
-        if new_ee_pos[2] < 0.0 or dist_to_bottle > 1.0 or obstacle_collision:
+        if new_ee_pos[2] < 0.0 or dist_to_bottle > 1.0:
             reward -= self.collision_penalty
             terminated = True
 
@@ -238,40 +235,33 @@ class FrankaTsidEnv(gym.Env):
             truncated = True 
 
         # ----------------------------------------------------
-        # 🌟 뷰어 (관전 모드) 로직
+        #  뷰어 (관전 모드) 로직
         # ----------------------------------------------------
         elapsed_time = time.time() - self.start_time
         
-        if self.is_play_mode:
+        #  [수정] 1분(60초)이 지나기 전이거나, 플레이 모드일 때는 화면을 켭니다.
+        if self.is_play_mode or elapsed_time < 60.0:
             if self.viewer is None:
                 self._render_viewer()
             
             if self.print_step_info:
                 act_str = f"pos[{action[0]:.2f}, {action[1]:.2f}, {action[2]:.2f}] rot[{action[3]:.2f}, {action[4]:.2f}, {action[5]:.2f}]"
-                print(f"👀 거리: {dist_to_bottle:.2f}m | 회전오차: {orientation_error:.2f}rad | 장애물여유: {obstacle_clearance:.2f}m | 🎯 AI명령: {act_str} | 💰 보상: {reward:.3f} | ⏰ 스텝: {self.current_step}/{self.max_steps}")
+                print(f"거리: {dist_to_bottle:.2f}m | 회전오차: {orientation_error:.2f}rad | 접촉힘(Z): {self.current_wrench[2]:.2f}N | AI명령: {act_str} | 보상: {reward:.3f} | 스텝: {self.current_step}/{self.max_steps}")  
             
         else:
             if self.viewer is not None:
-                print("\n⏰ 1분 관전 종료! 초고속 터보 모드로 전환합니다.\n")
+                print("\n1분 관전 종료! 화면을 끄고 초고속 학습 모드로 전환합니다.\n")
                 self.close()
                 self.viewer = None
 
         # --------- 여기 수정: 논문용 PPO 평가 그래프를 위한 info 반환 ----------
         info = {
-            "ee_pos": new_ee_pos.copy(),                      # 실제 EE 위치
-            "subgoal_pos": desired_pos.copy(),                # PPO action으로 갱신된 sub-goal 위치
-            "target_pos": self.target_bottle_pos.copy(),      # 최종 목표 위치
-            "dist_to_goal": dist_to_bottle,                   # ||target - EE||
+            "ee_pos": new_ee_pos.copy(),                      
+            "subgoal_pos": desired_pos.copy(),                
+            "target_pos": self.target_bottle_pos.copy(),      
+            "dist_to_goal": dist_to_bottle,                   
             "orientation_error": orientation_error,
             "target_quat_wxyz": self._quat_wxyz(self.target_ee_quat),
-            "obstacle_pos": self.obstacle_pos.copy(),
-            "obstacle_radius": self.obstacle_radius,
-            "obstacle_size": self.obstacle_size.copy(),
-            "obstacle_clearance": obstacle_clearance,
-            "obstacle_near_penalty": obstacle_near_penalty,
-            "obstacle_collision": obstacle_collision,
-            "obstacle_contact_count": obstacle_contact_count,
-            "obstacle_contact_pos": obstacle_contact_pos.copy(),
             "progress_reward": progress_reward,
             "subgoal_tracking_error": np.linalg.norm(desired_pos - new_ee_pos),
             "goal_tracking_error": np.linalg.norm(self.target_bottle_pos - new_ee_pos),
@@ -280,6 +270,7 @@ class FrankaTsidEnv(gym.Env):
             "action": np.array(action).copy(),
             "action_norm": np.linalg.norm(action),
             "sim_time": self.mj_data.time,
+            "current_force_z": self.current_wrench[2], # 🌟 데이터 분석용으로 접촉 힘 기록
         }
         return obs, reward, terminated, truncated, info
 # ----------------------------------------------------------------------
@@ -319,10 +310,10 @@ class FrankaTsidEnv(gym.Env):
         self.integral_error_pos = np.clip(self.integral_error_pos, -0.25, 0.25)
         self.integral_error_rot = np.clip(self.integral_error_rot, -0.25, 0.25)
         
-        # PD 가속도 지령
+        # modified: PD 가속도 지령 (PPO가 준 current_Kp_pos 적용!)
         a_pos = (
-            (self.Kp_pos * e_pos)
-            + (self.Kd_pos * e_vel)
+            (self.current_Kp_pos * e_pos)
+            + (self.current_Kd_pos * e_vel)
             + (self.Ki_pos * self.integral_error_pos)
         )
         a_rot = (
@@ -416,35 +407,6 @@ class FrankaTsidEnv(gym.Env):
         r_yaw = pin.exp3(np.array([0.0, 0.0, yaw]))
         return r_yaw @ r_pitch @ r_roll
 
-    def _sample_obstacle_on_path(self, start_pos, goal_pos):
-        path_vec = goal_pos - start_pos
-        path_len = np.linalg.norm(path_vec)
-        if path_len < 1e-6:
-            path_dir = np.array([1.0, 0.0, 0.0])
-        else:
-            path_dir = path_vec / path_len
-
-        alpha = np.random.uniform(0.38, 0.55)
-        center = start_pos + alpha * path_vec
-
-        rand_vec = np.random.normal(size=3)
-        perp = rand_vec - np.dot(rand_vec, path_dir) * path_dir
-        perp_norm = np.linalg.norm(perp)
-        if perp_norm < 1e-6:
-            perp = np.array([0.0, 1.0, 0.0])
-        else:
-            perp = perp / perp_norm
-
-        center = center + perp * np.random.uniform(-0.015, 0.015)
-        center[0] = np.clip(center[0], 0.3, 0.6)
-        center[1] = np.clip(center[1], -0.3, 0.3)
-        center[2] = np.clip(center[2], 0.2, 0.6)
-
-        self.obstacle_pos = center
-        scale = np.random.uniform(0.85, 1.15)
-        self.obstacle_size = np.array([0.018, 0.035, 0.035], dtype=float) * scale
-        self.obstacle_radius = np.linalg.norm(self.obstacle_size)
-
     def _update_target_visuals(self):
         if self.target_mocap_idx != -1:
             self.mj_data.mocap_pos[self.target_mocap_idx] = self.target_bottle_pos
@@ -464,60 +426,26 @@ class FrankaTsidEnv(gym.Env):
             self.mj_data.mocap_pos[self.ee_arrow_mocap_idx] = ee_pos
             self.mj_data.mocap_quat[self.ee_arrow_mocap_idx] = self._quat_wxyz(ee_quat)
 
-    def _update_obstacle_geom(self):
-        if self.obstacle_mocap_idx != -1:
-            self.mj_data.mocap_pos[self.obstacle_mocap_idx] = self.obstacle_pos
-        if self.obstacle_geom_id != -1:
-            self.mj_model.geom_size[self.obstacle_geom_id, :3] = self.obstacle_size
-            self.mj_model.geom_margin[self.obstacle_geom_id] = self.obstacle_safety_margin
-        mujoco.mj_forward(self.mj_model, self.mj_data)
+# 🌟 [NEW] 외부 접촉 힘 역산 알고리즘 추가
+    def _get_external_force(self):
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.target_body_name)
+        if body_id == -1:
+            return np.zeros(6)
 
-    def _update_contact_marker(self, contact_pos):
-        if self.contact_marker_mocap_idx == -1:
-            return
-        self.mj_data.mocap_pos[self.contact_marker_mocap_idx] = contact_pos
-
-    def _get_obstacle_contact_info(self):
-        if self.obstacle_geom_id == -1:
-            ee_clearance = np.linalg.norm(self._get_ee_pos() - self.obstacle_pos) - self.obstacle_radius
-            contact_pos = self._get_ee_pos() if ee_clearance < 0.0 else np.array([0.0, 0.0, -1.0])
-            return ee_clearance < 0.0, int(ee_clearance < 0.0), ee_clearance, contact_pos
-
-        collision = False
-        contact_count = 0
-        min_clearance = np.inf
-        contact_pos = np.array([0.0, 0.0, -1.0], dtype=float)
-
-        for i in range(self.mj_data.ncon):
-            contact = self.mj_data.contact[i]
-            geom1 = contact.geom1
-            geom2 = contact.geom2
-            if geom1 != self.obstacle_geom_id and geom2 != self.obstacle_geom_id:
-                continue
-
-            other_geom = geom2 if geom1 == self.obstacle_geom_id else geom1
-            other_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, other_geom)
-            if other_name == "floor":
-                continue
-
-            min_clearance = min(min_clearance, contact.dist)
-            if contact.dist <= min_clearance:
-                contact_pos = contact.pos.copy()
-            if contact.dist <= 0.0:
-                collision = True
-                contact_count += 1
-
-        if np.isinf(min_clearance):
-            min_clearance = self._approx_ee_box_clearance()
-
-        return collision, contact_count, min_clearance, contact_pos
-
-    def _approx_ee_box_clearance(self):
-        ee_pos = self._get_ee_pos()
-        delta = np.abs(ee_pos - self.obstacle_pos) - self.obstacle_size
-        outside_dist = np.linalg.norm(np.maximum(delta, 0.0))
-        inside_dist = np.min(self.obstacle_size - np.abs(ee_pos - self.obstacle_pos))
-        return outside_dist if np.any(delta > 0.0) else -inside_dist
+        jac_pos = np.zeros((3, self.mj_model.nv))
+        jac_rot = np.zeros((3, self.mj_model.nv))
+        mujoco.mj_jacBody(self.mj_model, self.mj_data, jac_pos, jac_rot, body_id)
+        
+        # 6x7 자코비안 생성
+        J = np.vstack([jac_pos[:, :self.n_arm], jac_rot[:, :self.n_arm]]) 
+        
+        # 토크 잔차(Residual) 계산
+        tau_residual = self.mj_data.qfrc_actuator[:self.n_arm] - self.mj_data.qfrc_bias[:self.n_arm]
+        
+        # 유사역행렬을 통한 Wrench 추정
+        J_T_pinv = np.linalg.pinv(J.T)
+        wrench_ext = J_T_pinv @ tau_residual
+        return wrench_ext
 
     def _get_obs(self):
         q = self.mj_data.qpos[:self.n_arm].copy()
@@ -526,16 +454,18 @@ class FrankaTsidEnv(gym.Env):
         curr_ee_quat = self._get_ee_quat()
         pos_error = self.target_bottle_pos - curr_ee_pos
         ori_error = self._orientation_error(self.target_ee_quat, curr_ee_quat)
-        obstacle_rel = self.obstacle_pos - curr_ee_pos
+        
+        # 🌟 매 스텝 힘 역산 수행 및 정규화(/10.0)
+        self.current_wrench = self._get_external_force()
+        norm_wrench = self.current_wrench / 10.0
         
         return np.concatenate([
-            q,
-            dq,
-            curr_ee_pos,
-            pos_error,
-            ori_error,
-            obstacle_rel,
-            np.array([self.obstacle_radius]),
+            q,             # 7
+            dq,            # 7
+            curr_ee_pos,   # 3
+            pos_error,     # 3
+            ori_error,     # 3
+            norm_wrench    # 6 (총 29차원)
         ]).astype(np.float32)
 
     def _render_viewer(self):
