@@ -95,46 +95,52 @@ class FrankaStage2PrecisionEnv(gym.Env):
         self.near_max_rot_step = 0.035
 
         # -------------------------
-        # Reward weights
+        # Stage2 Reward weights: simple version
         # -------------------------
-        self.w_dist = 2.5
-        self.w_dist_sq = 4.0
 
+
+
+        # 목표 추종
+        self.w_pos = 2.0
         self.w_ori = 0.8
-        self.w_ori_sq = 0.8
+        self.w_progress = 0.5
 
-        self.w_progress = 6.0
-        self.w_ori_progress = 1.5
+        # subgoal 부드러움
+        self.w_subgoal_jump_pos = 2.0
+        self.w_subgoal_jump_rot = 0.5
 
-        self.w_action_pos = 0.010
-        self.w_action_rot = 0.010
-        self.w_action_smooth = 0.050
+        # 목표 근처 떨림 억제
+        self.w_near_goal_vel = 0.5
+        self.near_goal_threshold = 0.05
 
-        self.w_subgoal_jump_pos = 1.5
-        self.w_subgoal_jump_rot = 0.3
+        self.near_dist_threshold = 0.10
+        self.very_near_dist_threshold = 0.05
 
-        self.w_near_linear_vel = 0.8
-        self.w_near_angular_vel = 0.2
-
+        # workspace
         self.w_workspace = 5.0
-        self.time_penalty = 0.005
 
-        self.near_dist_threshold = 0.08
-        self.very_near_dist_threshold = 0.04
+        # 버튼 충돌 금지
+        self.button_collision_penalty = 10.0
 
-        self.near_bonus = 0.10
-        self.very_near_bonus = 0.30
+        # 시간 관련
+        self.fast_reach_step_limit = 17      # 1.7초 / rl_dt 0.1초
+        self.fast_reach_bonus = 2.0
+        self.first_reach_step = None
+        self.fast_bonus_given = False
 
+        # 목표 유지
+        self.hold_bonus_per_step = 0.05
+        self.required_hold_steps = 30        # 3초 / rl_dt 0.1초
+        self.hold_counter = 0
+
+        # 성공/실패
         self.success_bonus = 8.0
         self.failure_penalty = 5.0
 
-        # Stage2 success condition
-        self.success_dist = 0.020
-        self.success_ori = 0.100
-        self.success_linear_vel = 0.030
-        self.success_angular_vel = 0.100
-        self.required_success_steps = 4
-        self.success_counter = 0
+        # Stage2 성공 기준
+        self.success_dist = 0.05             # 5 cm
+        self.success_ori = 0.20              # 0.2 rad
+
 
         # Workspace clipping
         self.workspace_low = np.array([0.30, -0.30, 0.20], dtype=float)
@@ -215,6 +221,14 @@ class FrankaStage2PrecisionEnv(gym.Env):
         self.action_arrow_mocap_idx = self._get_mocap_idx("ai_action_arrow")
         self.ee_arrow_mocap_idx = self._get_mocap_idx("ee_arrow")
 
+        #geom id
+        self.button_geom_id = mujoco.mj_name2id(
+            self.mj_model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "button_geom",
+        )
+        self.button_rgba_default = np.array([1.0, 0.4, 0.1, 1.0])
+        self.button_rgba_contact = np.array([1.0, 0.0, 0.0, 1.0])
         # State memory
         self.prev_dist = 0.0
         self.prev_ori_err = 0.0
@@ -235,9 +249,14 @@ class FrankaStage2PrecisionEnv(gym.Env):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
         self.mj_data.qpos[: self.n_arm] = self.q_nominal.copy()
         mujoco.mj_forward(self.mj_model, self.mj_data)
+        self.hold_counter = 0
+        self.first_reach_step = None
+        self.fast_bonus_given = False
 
+        if self.button_geom_id != -1:
+            self.mj_model.geom_rgba[self.button_geom_id] = self.button_rgba_default
+        
         self.current_step = 0
-        self.success_counter = 0
         self.start_time = time.time()
 
         self.prev_action[:] = 0.0
@@ -266,7 +285,19 @@ class FrankaStage2PrecisionEnv(gym.Env):
         self.last_reward_terms = {}
 
         return self._get_obs(), {}
+    
+    def _check_button_collision(self):
+        if self.button_geom_id == -1:
+            return False
 
+        for i in range(self.mj_data.ncon):
+            contact = self.mj_data.contact[i]
+
+            if contact.geom1 == self.button_geom_id or contact.geom2 == self.button_geom_id:
+                return True
+
+        return False
+    
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
 
@@ -319,41 +350,65 @@ class FrankaStage2PrecisionEnv(gym.Env):
         ori_err = np.linalg.norm(self._orientation_error(self.target_quat, new_quat))
 
         progress = self.prev_dist - dist
-        ori_progress = self.prev_ori_err - ori_err
-
-        action_pos_norm_sq = float(np.dot(action[:3], action[:3]))
-        action_rot_norm_sq = float(np.dot(action[3:6], action[3:6]))
-
-        action_delta = action - self.prev_action
-        action_smooth = np.linalg.norm(action_delta)
 
         linear_vel_norm = np.linalg.norm(new_v)
         angular_vel_norm = np.linalg.norm(new_w)
 
-        near_factor = 1.0 if dist < self.near_dist_threshold else 0.0
-        very_near_factor = 1.0 if dist < self.very_near_dist_threshold else 0.0
+        near_goal = dist < self.near_goal_threshold
+        near_goal_vel_penalty = linear_vel_norm**2 + 0.2 * angular_vel_norm**2 if near_goal else 0.0
+
+        button_collision = self._check_button_collision()
+
+        if self.button_geom_id != -1:
+            if button_collision:
+                self.mj_model.geom_rgba[self.button_geom_id] = self.button_rgba_contact
+            else:
+                self.mj_model.geom_rgba[self.button_geom_id] = self.button_rgba_default
+
+        reach_condition = dist < self.success_dist and ori_err < self.success_ori
+
+        if reach_condition:
+            self.hold_counter += 1
+
+            if self.first_reach_step is None:
+                self.first_reach_step = self.current_step
+        else:
+            self.hold_counter = 0
+
+        fast_reach_bonus = 0.0
+        if (
+            self.first_reach_step is not None
+            and self.first_reach_step <= self.fast_reach_step_limit
+            and not self.fast_bonus_given
+        ):
+            fast_reach_bonus = self.fast_reach_bonus
+            self.fast_bonus_given = True
+
+        hold_bonus = self.hold_bonus_per_step if reach_condition else 0.0
 
         reward_terms = {
-            "dist": -self.w_dist * dist,
-            "dist_sq": -self.w_dist_sq * dist**2,
-            "ori": -self.w_ori * ori_err,
-            "ori_sq": -self.w_ori_sq * ori_err**2,
-            "progress": self.w_progress * progress,
-            "ori_progress": self.w_ori_progress * ori_progress,
-            "action_pos": -self.w_action_pos * action_pos_norm_sq,
-            "action_rot": -self.w_action_rot * action_rot_norm_sq,
-            "action_smooth": -self.w_action_smooth * action_smooth**2,
-            "subgoal_jump_pos": -self.w_subgoal_jump_pos * subgoal_jump_pos**2,
-            "subgoal_jump_rot": -self.w_subgoal_jump_rot * subgoal_jump_rot**2,
-            "near_linear_vel": -near_factor * self.w_near_linear_vel * linear_vel_norm**2,
-            "near_angular_vel": -near_factor * self.w_near_angular_vel * angular_vel_norm**2,
-            "workspace": -self.w_workspace * workspace_violation,
-            "time": -self.time_penalty,
-            "near_bonus": self.near_bonus if dist < self.near_dist_threshold else 0.0,
-            "very_near_bonus": self.very_near_bonus if dist < self.very_near_dist_threshold else 0.0,
+            # penalties
+            "penalty_position_error": -self.w_pos * dist,
+            "penalty_orientation_error": -self.w_ori * ori_err,
+            "penalty_subgoal_jump_pos": -self.w_subgoal_jump_pos * subgoal_jump_pos**2,
+            "penalty_subgoal_jump_rot": -self.w_subgoal_jump_rot * subgoal_jump_rot**2,
+            "penalty_near_goal_velocity": -self.w_near_goal_vel * near_goal_vel_penalty,
+            "penalty_workspace": -self.w_workspace * workspace_violation,
+            "penalty_button_collision": -self.button_collision_penalty if button_collision else 0.0,
+
+            # bonuses
+            "bonus_progress": self.w_progress * progress,
+            "bonus_hold": hold_bonus,
+            "bonus_fast_reach": fast_reach_bonus,
+
+            # terminal terms
+            "bonus_success": 0.0,
+            "penalty_failure": 0.0,
         }
 
         reward = float(sum(reward_terms.values()))
+
+        
 
         self.current_step += 1
 
@@ -362,44 +417,28 @@ class FrankaStage2PrecisionEnv(gym.Env):
         success = False
         failure = False
 
-        success_candidate = (
-            dist < self.success_dist
-            and ori_err < self.success_ori
-            and linear_vel_norm < self.success_linear_vel
-            and angular_vel_norm < self.success_angular_vel
-        )
-
-        if success_candidate:
-            self.success_counter += 1
-        else:
-            self.success_counter = 0
 
         if not np.isfinite(new_pos).all() or not np.isfinite(ori_err):
             reward -= self.failure_penalty
-            reward_terms["failure"] = -self.failure_penalty
+            reward_terms["penalty_failure"] = -self.failure_penalty
             terminated = True
             failure = True
 
         elif new_pos[2] < 0.05 or dist > 1.20:
             reward -= self.failure_penalty
-            reward_terms["failure"] = -self.failure_penalty
+            reward_terms["penalty_failure"] = -self.failure_penalty
             terminated = True
             failure = True
 
-        elif self.success_counter >= self.required_success_steps:
+        elif self.hold_counter >= self.required_hold_steps:
             reward += self.success_bonus
-            reward_terms["success"] = self.success_bonus
+            reward_terms["bonus_success"] = self.success_bonus
             terminated = True
             success = True
 
         elif self.current_step >= self.max_steps:
             truncated = True
 
-        if "failure" not in reward_terms:
-            reward_terms["failure"] = 0.0
-
-        if "success" not in reward_terms:
-            reward_terms["success"] = 0.0
 
         self.last_reward_terms = reward_terms.copy()
 
@@ -411,26 +450,35 @@ class FrankaStage2PrecisionEnv(gym.Env):
             "target_quat_wxyz": self._quat_wxyz(self.target_quat),
             "desired_pos": desired_pos.copy(),
             "desired_quat_wxyz": self._quat_wxyz(desired_quat),
+
             "dist_to_goal": float(dist),
             "orientation_error": float(ori_err),
             "progress": float(progress),
-            "orientation_progress": float(ori_progress),
+
             "linear_vel_norm": float(linear_vel_norm),
             "angular_vel_norm": float(angular_vel_norm),
+
             "workspace_violation": float(workspace_violation),
             "action_norm": float(np.linalg.norm(action)),
-            "action_smooth": float(action_smooth),
+
             "subgoal_jump_pos": float(subgoal_jump_pos),
             "subgoal_jump_rot": float(subgoal_jump_rot),
+
             "max_step_size": float(max_step_size),
             "max_rot_step": float(max_rot_step),
-            "success_counter": int(self.success_counter),
-            "success_candidate": bool(success_candidate),
+
             "success": bool(success),
             "failure": bool(failure),
+
             "reward_terms": reward_terms.copy(),
             "reward_total": float(reward),
             "sim_time": float(self.mj_data.time),
+
+            "button_collision": bool(button_collision),
+            "hold_counter": int(self.hold_counter),
+            "first_reach_step": -1 if self.first_reach_step is None else int(self.first_reach_step),
+            "reach_condition": bool(reach_condition),
+            "near_goal": bool(near_goal),
         }
 
         if self.is_play_mode:
@@ -444,7 +492,7 @@ class FrankaStage2PrecisionEnv(gym.Env):
                     f"v={linear_vel_norm:.4f} m/s | "
                     f"w={angular_vel_norm:.4f} rad/s | "
                     f"reward={reward:.3f} | "
-                    f"success_cnt={self.success_counter}/{self.required_success_steps} | "
+                    f"hold_cnt={self.hold_counter}/{self.required_hold_steps} | "
                     f"step={self.current_step}/{self.max_steps}"
                 )
 
