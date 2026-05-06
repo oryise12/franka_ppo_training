@@ -16,19 +16,7 @@ time/fps
 python3 play.py --model ./models/checkpoints/ppo_franka_delta_300000_steps
 python3 interactive_play.py --model ./models/checkpoints/ppo_franka_delta_v4_150000_steps.zip 
 
-------------obstacle addition----------
-train commands
-python3 train_pose_obstacle.py --timesteps 100000 --save-freq 10000 --n-steps 512 --print-freq 100 --progress-bar
+----------------
+MUJOCO_GL=glfw python3 play_franka_stage1.py   --model ./models/stage1/checkpoints/ppo_franka_stage1_reach_pose_500000_steps.zip 
 
-tensor
-tensorboard --logdir ./ppo_tensorboard_pose_obstacle/
-
-python3 play_pose_obstacle.py --model ./models/ppo_franka_pose_obstacle_v1_seed0_final.zip --episodes 1
-
-
-python3 play_pose_obstacle.py --model ./models/checkpoints/ppo_franka_pose_obstacle_v1_100000_steps.zip --episodes 1 --continue-after-collision
-
-python3 play_pose_obstacle.py --model ./models/checkpoints/ppo_franka_pose_obstacle_v1_100000_steps.zip --episodes 1 --print-interval 2.0
-
-python3 play_pose_obstacle.py --model ./models/checkpoints/ppo_franka_pose_obstacle_v1_100000_steps.zip --episodes 1 --no-real-time
 

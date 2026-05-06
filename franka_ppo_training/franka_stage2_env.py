@@ -1,6 +1,8 @@
+# franka_stage2_env.py
+
 import os
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 import numpy as np
 import gymnasium as gym
@@ -14,22 +16,29 @@ from qpsolvers import solve_qp
 from robot_descriptions.panda_description import URDF_PATH
 
 
-class FrankaStage1ReachPoseEnv(gym.Env):
+class FrankaStage2PrecisionEnv(gym.Env):
     """
-    Stage 1 environment for PPO + TSID.
+    Stage 2 PPO + TSID environment.
 
-    Purpose:
-        Learn high-level pose subgoal generation only.
-        PPO outputs small EE position/orientation deltas.
-        TSID/QP tracks the generated subgoal.
-        Position stiffness is fixed in this stage.
+    목적:
+    - Stage1 정책을 이어받아 fine-tuning
+    - 목표 근처 위치/방위 정확도 향상
+    - 목표 근처 떨림 감소
+    - PPO subgoal 변화량 완화
 
-    Action, shape=(6,):
-        action[0:3] -> delta EE position command, scaled by max_step_size
-        action[3:6] -> delta EE orientation rotvec command, scaled by max_rot_step
+    Stage1 정책 load를 위해 action/observation dimension은 유지합니다.
 
-    Observation, shape=(29,):
-        q(7), dq(7), ee_pos(3), goal_pos_error(3), goal_ori_error(3), prev_action(6)
+    Action: shape=(6,)
+        action[0:3] = delta position
+        action[3:6] = delta rotation vector
+
+    Observation: shape=(29,)
+        q(7)
+        dq(7)
+        ee_pos(3)
+        pos_error(3)
+        ori_error(3)
+        prev_action(6)
     """
 
     metadata = {"render_modes": ["human", None], "render_fps": 30}
@@ -39,10 +48,11 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         render_mode: Optional[str] = None,
         print_step_info: bool = False,
         viewer_sync_interval: int = 10,
-        max_steps: int = 100,
+        max_steps: int = 120,
         fixed_target_pos: Optional[np.ndarray] = None,
         randomize_target_pos: bool = False,
-        orientation_level: str = "small",  # "none", "small", "medium"
+        orientation_level: str = "small",
+        use_adaptive_action_scale: bool = True,
     ):
         super().__init__()
 
@@ -52,16 +62,10 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         self.print_step_info = print_step_info
         self.viewer_sync_interval = max(1, int(viewer_sync_interval))
 
-        # -------------------------
-        # RL timing
-        # -------------------------
         self.max_steps = int(max_steps)
         self.current_step = 0
         self.start_time = None
 
-        # -------------------------
-        # Stage-1 action / observation
-        # -------------------------
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -76,36 +80,67 @@ class FrankaStage1ReachPoseEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # PPO action scaling.
-        # 0.05 m per RL step at rl_dt=0.1 s means max nominal subgoal speed is about 0.5 m/s.
-        self.max_step_size = 0.05
-        self.max_rot_step = 0.12
+        # -------------------------
+        # Stage2 action scale
+        # -------------------------
+        self.use_adaptive_action_scale = use_adaptive_action_scale
+
+        self.base_max_step_size = 0.030
+        self.base_max_rot_step = 0.080
+
+        self.mid_max_step_size = 0.020
+        self.mid_max_rot_step = 0.060
+
+        self.near_max_step_size = 0.010
+        self.near_max_rot_step = 0.035
 
         # -------------------------
         # Reward weights
         # -------------------------
-        self.w_dist = 2.0
-        self.w_ori = 0.4
-        self.w_progress = 10.0
-        self.w_ori_progress = 1.0
-        self.w_action_pos = 0.02
-        self.w_action_rot = 0.01
-        self.w_action_smooth = 0.02
+        self.w_dist = 2.5
+        self.w_dist_sq = 4.0
+
+        self.w_ori = 0.8
+        self.w_ori_sq = 0.8
+
+        self.w_progress = 6.0
+        self.w_ori_progress = 1.5
+
+        self.w_action_pos = 0.010
+        self.w_action_rot = 0.010
+        self.w_action_smooth = 0.050
+
+        self.w_subgoal_jump_pos = 1.5
+        self.w_subgoal_jump_rot = 0.3
+
+        self.w_near_linear_vel = 0.8
+        self.w_near_angular_vel = 0.2
+
         self.w_workspace = 5.0
         self.time_penalty = 0.005
-        self.success_bonus = 5.0
+
+        self.near_dist_threshold = 0.08
+        self.very_near_dist_threshold = 0.04
+
+        self.near_bonus = 0.10
+        self.very_near_bonus = 0.30
+
+        self.success_bonus = 8.0
         self.failure_penalty = 5.0
 
-        self.success_dist = 0.03
-        self.success_ori = 0.15
+        # Stage2 success condition
+        self.success_dist = 0.020
+        self.success_ori = 0.100
+        self.success_linear_vel = 0.030
+        self.success_angular_vel = 0.100
+        self.required_success_steps = 4
+        self.success_counter = 0
 
-        # Workspace clipping for generated subgoals.
+        # Workspace clipping
         self.workspace_low = np.array([0.30, -0.30, 0.20], dtype=float)
         self.workspace_high = np.array([0.65, 0.30, 0.65], dtype=float)
 
-        # -------------------------
-        # Target setup
-        # -------------------------
+        # Target
         self.fixed_target_pos = (
             np.array([0.50, 0.00, 0.44], dtype=float)
             if fixed_target_pos is None
@@ -120,7 +155,9 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         # -------------------------
         # MuJoCo / Pinocchio
         # -------------------------
-        menagerie_dir = os.path.expanduser("~/ros2_ws_py/src/mujoco_menagerie/franka_emika_panda")
+        menagerie_dir = os.path.expanduser(
+            "~/ros2_ws_py/src/mujoco_menagerie/franka_emika_panda"
+        )
         xml_path = os.path.join(menagerie_dir, "scene.xml")
 
         self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
@@ -128,59 +165,71 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         self.pin_model = pin.buildModelFromUrdf(URDF_PATH)
         self.pin_data = self.pin_model.createData()
+
         self.n_pin = self.pin_model.nq
         self.n_arm = 7
 
         # -------------------------
-        # TSID gains and robot limits
+        # TSID gains
         # -------------------------
-        self.fixed_Kp_pos = np.array([260.0, 260.0, 260.0], dtype=float)
-        self.fixed_Kd_pos = 2.0 * np.sqrt(self.fixed_Kp_pos)
+        self.Kp_pos = 260.0
+        self.Kd_pos = 2.0 * np.sqrt(self.Kp_pos)
+        self.Ki_pos = 30.0
 
         self.Kp_rot = 260.0
         self.Kd_rot = 2.0 * np.sqrt(self.Kp_rot)
+        self.Ki_rot = 15.0
+
         self.Kp_post = 130.0
         self.Kd_post = 2.0 * np.sqrt(self.Kp_post)
 
-        self.Ki_pos = 30.0
-        self.Ki_rot = 15.0
         self.integral_error_pos = np.zeros(3, dtype=float)
         self.integral_error_rot = np.zeros(3, dtype=float)
+
+        self.integral_clip_pos = 0.20
+        self.integral_clip_rot = 0.20
 
         self.w_ee = 1.0
         self.w_post = 0.009
 
-        self.q_nominal = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785], dtype=float)
+        self.q_nominal = np.array(
+            [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785],
+            dtype=float,
+        )
+
         self.tau_max = np.array([87, 87, 87, 87, 12, 12, 12], dtype=float)
 
         self.target_body_name = "panda_hand_tcp"
         self.pin_ee_id = self.pin_model.getFrameId(self.target_body_name)
 
-        # Panda hand nominal reference orientation used by the previous environment.
         self.q_ref = pin.Quaternion(0, 1, 0, 0)
 
         self.sim_dt = self.mj_model.opt.timestep
         self.rl_dt = 0.1
         self.n_substeps = max(1, int(round(self.rl_dt / self.sim_dt)))
 
-        # -------------------------
-        # Optional mocap visualization bodies
-        # -------------------------
+        # Mocap visualization
         self.target_mocap_idx = self._get_mocap_idx("target_bottle")
         self.action_mocap_idx = self._get_mocap_idx("ai_action")
         self.target_arrow_mocap_idx = self._get_mocap_idx("target_arrow")
         self.action_arrow_mocap_idx = self._get_mocap_idx("ai_action_arrow")
         self.ee_arrow_mocap_idx = self._get_mocap_idx("ee_arrow")
 
-        # State memory for reward and observation.
+        # State memory
         self.prev_dist = 0.0
         self.prev_ori_err = 0.0
         self.prev_action = np.zeros(6, dtype=float)
 
-    # ------------------------------------------------------------------
-    # Gym API
-    # ------------------------------------------------------------------
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        self.prev_desired_pos = None
+        self.prev_desired_quat = None
+
+        self.last_reward_terms = {}
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ):
         super().reset(seed=seed)
 
         mujoco.mj_resetData(self.mj_model, self.mj_data)
@@ -188,8 +237,10 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
         self.current_step = 0
+        self.success_counter = 0
         self.start_time = time.time()
-        self.prev_action = np.zeros(6, dtype=float)
+
+        self.prev_action[:] = 0.0
 
         self.integral_error_pos[:] = 0.0
         self.integral_error_rot[:] = 0.0
@@ -201,11 +252,18 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         ee_quat = self._get_ee_quat()
 
         self.prev_dist = np.linalg.norm(self.target_pos - ee_pos)
-        self.prev_ori_err = np.linalg.norm(self._orientation_error(self.target_quat, ee_quat))
+        self.prev_ori_err = np.linalg.norm(
+            self._orientation_error(self.target_quat, ee_quat)
+        )
+
+        self.prev_desired_pos = ee_pos.copy()
+        self.prev_desired_quat = pin.Quaternion(ee_quat.matrix())
 
         self._update_target_visuals()
         self._update_action_visuals(ee_pos, ee_quat)
         self._update_ee_visuals(ee_pos, ee_quat)
+
+        self.last_reward_terms = {}
 
         return self._get_obs(), {}
 
@@ -214,15 +272,32 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         curr_pos = self._get_ee_pos()
         curr_quat = self._get_ee_quat()
+        curr_v, curr_w = self._get_ee_velocity()
 
-        delta_pos = action[:3] * self.max_step_size
-        delta_rot = action[3:6] * self.max_rot_step
+        dist_before_action = np.linalg.norm(self.target_pos - curr_pos)
+
+        max_step_size, max_rot_step = self._get_action_scale(dist_before_action)
+
+        delta_pos = action[:3] * max_step_size
+        delta_rot = action[3:6] * max_rot_step
 
         intended_pos = curr_pos + delta_pos
         desired_pos = np.clip(intended_pos, self.workspace_low, self.workspace_high)
         workspace_violation = np.linalg.norm(intended_pos - desired_pos)
 
         desired_quat = self._integrate_quat(curr_quat, delta_rot)
+
+        if self.prev_desired_pos is None:
+            subgoal_jump_pos = 0.0
+        else:
+            subgoal_jump_pos = np.linalg.norm(desired_pos - self.prev_desired_pos)
+
+        if self.prev_desired_quat is None:
+            subgoal_jump_rot = 0.0
+        else:
+            subgoal_jump_rot = np.linalg.norm(
+                self._orientation_error(desired_quat, self.prev_desired_quat)
+            )
 
         self._update_action_visuals(desired_pos, desired_quat)
 
@@ -236,6 +311,8 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         new_pos = self._get_ee_pos()
         new_quat = self._get_ee_quat()
+        new_v, new_w = self._get_ee_velocity()
+
         self._update_ee_visuals(new_pos, new_quat)
 
         dist = np.linalg.norm(self.target_pos - new_pos)
@@ -243,19 +320,39 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         progress = self.prev_dist - dist
         ori_progress = self.prev_ori_err - ori_err
-        action_smooth = np.linalg.norm(action - self.prev_action)
+
+        action_pos_norm_sq = float(np.dot(action[:3], action[:3]))
+        action_rot_norm_sq = float(np.dot(action[3:6], action[3:6]))
+
+        action_delta = action - self.prev_action
+        action_smooth = np.linalg.norm(action_delta)
+
+        linear_vel_norm = np.linalg.norm(new_v)
+        angular_vel_norm = np.linalg.norm(new_w)
+
+        near_factor = 1.0 if dist < self.near_dist_threshold else 0.0
+        very_near_factor = 1.0 if dist < self.very_near_dist_threshold else 0.0
 
         reward_terms = {
             "dist": -self.w_dist * dist,
+            "dist_sq": -self.w_dist_sq * dist**2,
             "ori": -self.w_ori * ori_err,
+            "ori_sq": -self.w_ori_sq * ori_err**2,
             "progress": self.w_progress * progress,
             "ori_progress": self.w_ori_progress * ori_progress,
-            "action_pos": -self.w_action_pos * float(np.dot(action[:3], action[:3])),
-            "action_rot": -self.w_action_rot * float(np.dot(action[3:6], action[3:6])),
+            "action_pos": -self.w_action_pos * action_pos_norm_sq,
+            "action_rot": -self.w_action_rot * action_rot_norm_sq,
             "action_smooth": -self.w_action_smooth * action_smooth**2,
+            "subgoal_jump_pos": -self.w_subgoal_jump_pos * subgoal_jump_pos**2,
+            "subgoal_jump_rot": -self.w_subgoal_jump_rot * subgoal_jump_rot**2,
+            "near_linear_vel": -near_factor * self.w_near_linear_vel * linear_vel_norm**2,
+            "near_angular_vel": -near_factor * self.w_near_angular_vel * angular_vel_norm**2,
             "workspace": -self.w_workspace * workspace_violation,
             "time": -self.time_penalty,
+            "near_bonus": self.near_bonus if dist < self.near_dist_threshold else 0.0,
+            "very_near_bonus": self.very_near_bonus if dist < self.very_near_dist_threshold else 0.0,
         }
+
         reward = float(sum(reward_terms.values()))
 
         self.current_step += 1
@@ -265,20 +362,46 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         success = False
         failure = False
 
+        success_candidate = (
+            dist < self.success_dist
+            and ori_err < self.success_ori
+            and linear_vel_norm < self.success_linear_vel
+            and angular_vel_norm < self.success_angular_vel
+        )
+
+        if success_candidate:
+            self.success_counter += 1
+        else:
+            self.success_counter = 0
+
         if not np.isfinite(new_pos).all() or not np.isfinite(ori_err):
             reward -= self.failure_penalty
+            reward_terms["failure"] = -self.failure_penalty
             terminated = True
             failure = True
+
         elif new_pos[2] < 0.05 or dist > 1.20:
             reward -= self.failure_penalty
+            reward_terms["failure"] = -self.failure_penalty
             terminated = True
             failure = True
-        elif dist < self.success_dist and ori_err < self.success_ori:
+
+        elif self.success_counter >= self.required_success_steps:
             reward += self.success_bonus
+            reward_terms["success"] = self.success_bonus
             terminated = True
             success = True
+
         elif self.current_step >= self.max_steps:
             truncated = True
+
+        if "failure" not in reward_terms:
+            reward_terms["failure"] = 0.0
+
+        if "success" not in reward_terms:
+            reward_terms["success"] = 0.0
+
+        self.last_reward_terms = reward_terms.copy()
 
         obs = self._get_obs()
 
@@ -292,38 +415,54 @@ class FrankaStage1ReachPoseEnv(gym.Env):
             "orientation_error": float(ori_err),
             "progress": float(progress),
             "orientation_progress": float(ori_progress),
+            "linear_vel_norm": float(linear_vel_norm),
+            "angular_vel_norm": float(angular_vel_norm),
             "workspace_violation": float(workspace_violation),
             "action_norm": float(np.linalg.norm(action)),
-            "reward_terms": reward_terms,
-            "success": success,
-            "failure": failure,
+            "action_smooth": float(action_smooth),
+            "subgoal_jump_pos": float(subgoal_jump_pos),
+            "subgoal_jump_rot": float(subgoal_jump_rot),
+            "max_step_size": float(max_step_size),
+            "max_rot_step": float(max_rot_step),
+            "success_counter": int(self.success_counter),
+            "success_candidate": bool(success_candidate),
+            "success": bool(success),
+            "failure": bool(failure),
+            "reward_terms": reward_terms.copy(),
+            "reward_total": float(reward),
             "sim_time": float(self.mj_data.time),
         }
 
         if self.is_play_mode:
             if self.viewer is None:
                 self._render_viewer()
+
             if self.print_step_info:
                 print(
-                    f"dist={dist:.3f} m | ori={ori_err:.3f} rad | "
-                    f"reward={reward:.3f} | step={self.current_step}/{self.max_steps}"
+                    f"dist={dist:.4f} m | "
+                    f"ori={ori_err:.4f} rad | "
+                    f"v={linear_vel_norm:.4f} m/s | "
+                    f"w={angular_vel_norm:.4f} rad/s | "
+                    f"reward={reward:.3f} | "
+                    f"success_cnt={self.success_counter}/{self.required_success_steps} | "
+                    f"step={self.current_step}/{self.max_steps}"
                 )
 
         self.prev_dist = dist
         self.prev_ori_err = ori_err
         self.prev_action = action.copy()
+        self.prev_desired_pos = desired_pos.copy()
+        self.prev_desired_quat = pin.Quaternion(desired_quat.matrix())
 
         return obs, reward, terminated, truncated, info
 
-    # ------------------------------------------------------------------
-    # TSID / QP controller
-    # ------------------------------------------------------------------
     def _run_tsid_control(self, desired_pos: np.ndarray, desired_quat: pin.Quaternion):
         q_arm = self.mj_data.qpos[: self.n_arm].copy()
         v_arm = self.mj_data.qvel[: self.n_arm].copy()
 
         q_pin = np.zeros(self.n_pin, dtype=float)
         v_pin = np.zeros(self.n_pin, dtype=float)
+
         q_pin[: self.n_arm] = q_arm
         v_pin[: self.n_arm] = v_arm
 
@@ -343,12 +482,14 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         )[:, : self.n_arm]
 
         pin.computeJointJacobiansTimeVariation(self.pin_model, self.pin_data, q_pin, v_pin)
+
         Jdot_full = pin.getFrameJacobianTimeVariation(
             self.pin_model,
             self.pin_data,
             self.pin_ee_id,
             pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
         )
+
         dJv = Jdot_full[:, : self.n_arm] @ v_arm
 
         frame_vel = pin.getFrameVelocity(
@@ -357,6 +498,7 @@ class FrankaStage1ReachPoseEnv(gym.Env):
             self.pin_ee_id,
             pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
         )
+
         curr_v = frame_vel.linear
         curr_w = frame_vel.angular
 
@@ -366,14 +508,25 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         self.integral_error_pos += e_pos * self.sim_dt
         self.integral_error_rot += e_rot * self.sim_dt
-        self.integral_error_pos = np.clip(self.integral_error_pos, -0.20, 0.20)
-        self.integral_error_rot = np.clip(self.integral_error_rot, -0.20, 0.20)
+
+        self.integral_error_pos = np.clip(
+            self.integral_error_pos,
+            -self.integral_clip_pos,
+            self.integral_clip_pos,
+        )
+
+        self.integral_error_rot = np.clip(
+            self.integral_error_rot,
+            -self.integral_clip_rot,
+            self.integral_clip_rot,
+        )
 
         a_pos = (
-            self.fixed_Kp_pos * e_pos
-            + self.fixed_Kd_pos * e_vel
+            self.Kp_pos * e_pos
+            + self.Kd_pos * e_vel
             + self.Ki_pos * self.integral_error_pos
         )
+
         a_rot = (
             self.Kp_rot * e_rot
             - self.Kd_rot * curr_w
@@ -385,31 +538,47 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         e_post = self.q_nominal - q_arm
         a_post = self.Kp_post * e_post - self.Kd_post * v_arm
 
-        P = self.w_ee * (J.T @ J) + self.w_post * np.eye(self.n_arm) + 1e-4 * np.eye(self.n_arm)
+        P = (
+            self.w_ee * (J.T @ J)
+            + self.w_post * np.eye(self.n_arm)
+            + 1e-4 * np.eye(self.n_arm)
+        )
+
         P = 0.5 * (P + P.T)
+
         q_qp = -(self.w_ee * J.T @ b_acc) - self.w_post * a_post
 
         M = self.pin_data.M[: self.n_arm, : self.n_arm]
         h = self.pin_data.nle[: self.n_arm]
 
-        # Torque limits: -tau_max <= M ddq + h <= tau_max
         G = np.vstack([M, -M])
         h_ineq = np.concatenate([self.tau_max - h, self.tau_max + h])
 
         q_lower = self.mj_model.jnt_range[: self.n_arm, 0]
         q_upper = self.mj_model.jnt_range[: self.n_arm, 1]
+
         K_lim = 50.0
         D_lim = 2.0 * np.sqrt(K_lim)
         margin = 0.05
 
         ddq_ub = K_lim * (q_upper - margin - q_arm) - D_lim * v_arm
         ddq_lb = K_lim * (q_lower + margin - q_arm) - D_lim * v_arm
+
         ddq_ub = np.clip(ddq_ub, -50.0, 50.0)
         ddq_lb = np.clip(ddq_lb, -50.0, 50.0)
+
         ddq_lb = np.minimum(ddq_lb, ddq_ub - 0.1)
 
         try:
-            ddq = solve_qp(P, q_qp, G, h_ineq, lb=ddq_lb, ub=ddq_ub, solver="osqp")
+            ddq = solve_qp(
+                P,
+                q_qp,
+                G,
+                h_ineq,
+                lb=ddq_lb,
+                ub=ddq_ub,
+                solver="osqp",
+            )
         except Exception:
             ddq = None
 
@@ -419,44 +588,86 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         tau = M @ ddq + h
         tau = np.clip(tau, -self.tau_max, self.tau_max)
+
         self.mj_data.ctrl[: self.n_arm] = tau
 
-    # ------------------------------------------------------------------
-    # Observation / kinematics helpers
-    # ------------------------------------------------------------------
+    def _get_action_scale(self, dist: float):
+        if not self.use_adaptive_action_scale:
+            return self.base_max_step_size, self.base_max_rot_step
+
+        if dist < self.very_near_dist_threshold:
+            return self.near_max_step_size, self.near_max_rot_step
+
+        if dist < self.near_dist_threshold:
+            return self.mid_max_step_size, self.mid_max_rot_step
+
+        return self.base_max_step_size, self.base_max_rot_step
+
     def _get_obs(self):
         q = self.mj_data.qpos[: self.n_arm].copy()
         dq = self.mj_data.qvel[: self.n_arm].copy()
+
         ee_pos = self._get_ee_pos()
         ee_quat = self._get_ee_quat()
+
         pos_err = self.target_pos - ee_pos
         ori_err = self._orientation_error(self.target_quat, ee_quat)
 
-        obs = np.concatenate([
-            q,
-            dq,
-            ee_pos,
-            pos_err,
-            ori_err,
-            self.prev_action,
-        ])
+        obs = np.concatenate(
+            [
+                q,
+                dq,
+                ee_pos,
+                pos_err,
+                ori_err,
+                self.prev_action,
+            ]
+        )
+
         return obs.astype(np.float32)
 
     def _get_ee_pos(self):
         q_pin = np.zeros(self.n_pin, dtype=float)
         q_pin[: self.n_arm] = self.mj_data.qpos[: self.n_arm].copy()
+
         pin.forwardKinematics(self.pin_model, self.pin_data, q_pin)
         pin.updateFramePlacements(self.pin_model, self.pin_data)
+
         return self.pin_data.oMf[self.pin_ee_id].translation.copy()
 
     def _get_ee_quat(self):
         q_pin = np.zeros(self.n_pin, dtype=float)
         q_pin[: self.n_arm] = self.mj_data.qpos[: self.n_arm].copy()
+
         pin.forwardKinematics(self.pin_model, self.pin_data, q_pin)
         pin.updateFramePlacements(self.pin_model, self.pin_data)
+
         quat = pin.Quaternion(self.pin_data.oMf[self.pin_ee_id].rotation)
         quat.normalize()
+
         return quat
+
+    def _get_ee_velocity(self):
+        q_arm = self.mj_data.qpos[: self.n_arm].copy()
+        v_arm = self.mj_data.qvel[: self.n_arm].copy()
+
+        q_pin = np.zeros(self.n_pin, dtype=float)
+        v_pin = np.zeros(self.n_pin, dtype=float)
+
+        q_pin[: self.n_arm] = q_arm
+        v_pin[: self.n_arm] = v_arm
+
+        pin.forwardKinematics(self.pin_model, self.pin_data, q_pin)
+        pin.updateFramePlacements(self.pin_model, self.pin_data)
+
+        frame_vel = pin.getFrameVelocity(
+            self.pin_model,
+            self.pin_data,
+            self.pin_ee_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+
+        return frame_vel.linear.copy(), frame_vel.angular.copy()
 
     def _orientation_error(self, target_quat: pin.Quaternion, current_quat: pin.Quaternion):
         return pin.log3((target_quat * current_quat.inverse()).matrix())
@@ -466,11 +677,12 @@ class FrankaStage1ReachPoseEnv(gym.Env):
             new_quat = pin.Quaternion(quat.matrix())
         else:
             new_quat = pin.Quaternion(pin.exp3(delta_rotvec) @ quat.matrix())
+
         new_quat.normalize()
         return new_quat
 
     def _quat_wxyz(self, quat: pin.Quaternion):
-        coeffs = np.asarray(quat.coeffs()).reshape(-1)  # x, y, z, w in Pinocchio
+        coeffs = np.asarray(quat.coeffs()).reshape(-1)
         return np.array([coeffs[3], coeffs[0], coeffs[1], coeffs[2]], dtype=float)
 
     def _sample_target_pos(self):
@@ -479,11 +691,14 @@ class FrankaStage1ReachPoseEnv(gym.Env):
 
         low = np.array([0.42, -0.15, 0.34], dtype=float)
         high = np.array([0.58, 0.15, 0.54], dtype=float)
+
         return self.np_random.uniform(low=low, high=high).astype(float)
 
     def _sample_target_quat(self):
         if self.orientation_level == "none":
-            return pin.Quaternion(self.q_ref.matrix())
+            quat = pin.Quaternion(self.q_ref.matrix())
+            quat.normalize()
+            return quat
 
         if self.orientation_level == "small":
             roll_lim, pitch_lim, yaw_lim = 10.0, 10.0, 30.0
@@ -497,38 +712,50 @@ class FrankaStage1ReachPoseEnv(gym.Env):
         yaw = np.deg2rad(self.np_random.uniform(-yaw_lim, yaw_lim))
 
         target_rot = self._rpy_to_rot(roll, pitch, yaw) @ self.q_ref.matrix()
+
         quat = pin.Quaternion(target_rot)
         quat.normalize()
+
         return quat
 
     def _rpy_to_rot(self, roll: float, pitch: float, yaw: float):
         r_roll = pin.exp3(np.array([roll, 0.0, 0.0]))
         r_pitch = pin.exp3(np.array([0.0, pitch, 0.0]))
         r_yaw = pin.exp3(np.array([0.0, 0.0, yaw]))
+
         return r_yaw @ r_pitch @ r_roll
 
-    # ------------------------------------------------------------------
-    # Visualization helpers
-    # ------------------------------------------------------------------
     def _get_mocap_idx(self, body_name: str):
-        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        body_id = mujoco.mj_name2id(
+            self.mj_model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            body_name,
+        )
+
         if body_id == -1:
             return -1
+
         return int(self.mj_model.body_mocapid[body_id])
 
     def _update_target_visuals(self):
         if self.target_mocap_idx != -1:
             self.mj_data.mocap_pos[self.target_mocap_idx] = self.target_pos
+
         if self.target_arrow_mocap_idx != -1:
             self.mj_data.mocap_pos[self.target_arrow_mocap_idx] = self.target_pos
-            self.mj_data.mocap_quat[self.target_arrow_mocap_idx] = self._quat_wxyz(self.target_quat)
+            self.mj_data.mocap_quat[self.target_arrow_mocap_idx] = self._quat_wxyz(
+                self.target_quat
+            )
 
     def _update_action_visuals(self, desired_pos: np.ndarray, desired_quat: pin.Quaternion):
         if self.action_mocap_idx != -1:
             self.mj_data.mocap_pos[self.action_mocap_idx] = desired_pos
+
         if self.action_arrow_mocap_idx != -1:
             self.mj_data.mocap_pos[self.action_arrow_mocap_idx] = desired_pos
-            self.mj_data.mocap_quat[self.action_arrow_mocap_idx] = self._quat_wxyz(desired_quat)
+            self.mj_data.mocap_quat[self.action_arrow_mocap_idx] = self._quat_wxyz(
+                desired_quat
+            )
 
     def _update_ee_visuals(self, ee_pos: np.ndarray, ee_quat: pin.Quaternion):
         if self.ee_arrow_mocap_idx != -1:
@@ -538,6 +765,7 @@ class FrankaStage1ReachPoseEnv(gym.Env):
     def _render_viewer(self):
         if self.viewer is None:
             self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
+
         self.viewer.sync()
 
     def render(self):
@@ -551,4 +779,4 @@ class FrankaStage1ReachPoseEnv(gym.Env):
             except Exception as e:
                 print(f"[Warning] MuJoCo viewer close failed: {e}")
             finally:
-               self.viewer = None
+                self.viewer = None

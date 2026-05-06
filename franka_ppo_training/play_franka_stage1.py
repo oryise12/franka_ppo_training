@@ -1,9 +1,10 @@
 import os
+os.environ.setdefault("MUJOCO_GL", "glfw")
+
 import argparse
 import numpy as np
 
 from stable_baselines3 import PPO
-
 from franka_stage1_env import FrankaStage1ReachPoseEnv
 
 
@@ -135,7 +136,10 @@ def main():
             f"final_ori={final_ori:.4f} rad"
         )
 
-    env.close()
+    try:
+        env.close()
+    except Exception as e:
+        print(f"viewer close 중 경고 발생: {e}")
 
     print("\n================ Test Summary ================")
     print(f"Episodes           : {args.episodes}")
